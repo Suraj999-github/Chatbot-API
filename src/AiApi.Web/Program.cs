@@ -11,6 +11,7 @@ using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Options;
 using Microsoft.SemanticKernel;
 using Qdrant.Client;
+using Scalar.AspNetCore;
 using Serilog;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -24,10 +25,11 @@ builder.Host.UseSerilog((ctx, lc) =>
 // ── Options ────────────────────────────────────────────────
 builder.Services.Configure<AiProviderOptions>(
     builder.Configuration.GetSection(AiProviderOptions.SectionName));
+
 builder.Services.Configure<DocumentChatOptions>(
     builder.Configuration.GetSection(DocumentChatOptions.SectionName));
 
-// ── HttpClient (no Polly — Ollama is slow by design) ───────
+// ── HttpClient (Chat) ──────────────────────────────────────
 builder.Services.AddHttpClient("OllamaClient", (sp, client) =>
 {
     var opts = builder.Configuration
@@ -38,37 +40,38 @@ builder.Services.AddHttpClient("OllamaClient", (sp, client) =>
     client.Timeout = TimeSpan.FromSeconds(opts.TimeoutSeconds);
 });
 
-// Program.cs — add alongside the existing OllamaClient registration
-
+// ── HttpClient (Embeddings) ────────────────────────────────
 builder.Services.AddHttpClient("OllamaEmbedClient", (sp, client) =>
 {
     var opts = builder.Configuration
         .GetSection(AiProviderOptions.SectionName)
         .Get<AiProviderOptions>()!;
 
-    // Base URL without /v1 — embeddings use /api/embeddings
+    // Embeddings endpoint uses /api/embeddings
     var baseUrl = opts.BaseUrl.TrimEnd('/').Replace("/v1", "");
-    client.BaseAddress = new Uri(baseUrl);
 
-    // Per-call timeout for a single embedding (nomic-embed-text is fast, ~1-3s)
+    client.BaseAddress = new Uri(baseUrl);
     client.Timeout = TimeSpan.FromSeconds(30);
 });
 
-// ── Qdrant ───────────────────────────────────────────────────────────────── 
+// ── Qdrant ─────────────────────────────────────────────────
 builder.Services.AddSingleton(_ =>
 {
     var host = builder.Configuration["Qdrant:Host"] ?? "localhost";
     var port = int.Parse(builder.Configuration["Qdrant:Port"] ?? "6334");
+
     return new QdrantClient(host, port);
 });
 
-// ── AI Service (provider-switched via config) ───────────────
+// ── AI Provider Selection ──────────────────────────────────
 var provider = builder.Configuration["AiProvider:Provider"] ?? "Ollama";
 
 if (provider.Equals("OpenAI", StringComparison.OrdinalIgnoreCase) ||
     provider.Equals("AzureOpenAI", StringComparison.OrdinalIgnoreCase))
 {
+    // Future implementation
     // builder.Services.AddScoped<IAIChatService, OpenAIChatService>();
+
     throw new InvalidOperationException(
         $"Provider '{provider}' is configured but OpenAIChatService is not yet implemented.");
 }
@@ -77,95 +80,133 @@ else
     builder.Services.AddScoped<IAIChatService, OllamaChatService>();
 }
 
-
-// ── Document Parsing ─────────────────────────────────────────────────────── 
+// ── Document Parsing ───────────────────────────────────────
 builder.Services.AddSingleton<IDocumentParser, PdfDocumentParser>();
 builder.Services.AddSingleton<IDocumentParser, WordDocumentParser>();
 builder.Services.AddSingleton<DocumentParserFactory>();
 
-// ── Embedding + Vector Store ─────────────────────────────────────────────── 
+// ── Embeddings + Vector Store ──────────────────────────────
 builder.Services.AddScoped<IEmbeddingService, OllamaEmbeddingService>();
+
+// Production vector DB
 builder.Services.AddSingleton<IVectorStore, QdrantVectorStore>();
-// Development — in-memory, zero dependencies
+
+// Development/testing in-memory vector store
+// Remove if using only Qdrant
 builder.Services.AddSingleton<IVectorStore, InMemoryVectorStore>();
+
 builder.Services.AddScoped<RagService>();
 
-
-// ── Core AI Chat + RAG ───────────────────────────────────────────────────── 
-builder.Services.AddScoped<IAIChatService, OllamaChatService>();
+// ── Core AI Services ───────────────────────────────────────
 builder.Services.AddScoped<IDocumentIndexer, DocumentIndexer>();
 builder.Services.AddScoped<IDocumentChatService, DocumentChatService>();
 
-// Job infrastructure
+// ── Background Jobs ────────────────────────────────────────
 builder.Services.AddSingleton<IJobStore, InMemoryJobStore>();
 builder.Services.AddSingleton<DocumentIndexingQueue>();
 builder.Services.AddHostedService<DocumentIndexingWorker>();
 
-// ── API Infra ──────────────────────────────────────────────
-// In Program.cs — add Semantic Kernel with Ollama as OpenAI-compatible endpoint 
+// ── Semantic Kernel ────────────────────────────────────────
 builder.Services.AddSingleton(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<AiProviderOptions>>().Value;
+
     return Kernel.CreateBuilder()
         .AddOpenAIChatCompletion(
             modelId: opts.DefaultModel,
-            apiKey: opts.ApiKey.Length > 0 ? opts.ApiKey : "ollama",
+            apiKey: string.IsNullOrWhiteSpace(opts.ApiKey)
+                ? "ollama"
+                : opts.ApiKey,
             endpoint: new Uri(opts.BaseUrl))
         .Build();
 });
 
+// ── Controllers + OpenAPI + Scalar ─────────────────────────
 builder.Services.AddControllers();
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen(c =>
-    c.SwaggerDoc("v1", new() { Title = "Document Chatbot API", Version = "v1" }));
-builder.Services.AddCors(o => o.AddPolicy("Default", p =>
-    p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()));
+builder.Services.AddEndpointsApiExplorer(); 
+builder.Services.AddSwaggerGen(c =>          
+{
+    c.SwaggerDoc("v1", new() { Title = "Document Chatbot API", Version = "v1" });
+});
+
+// OpenAPI document generation
+
+// ── CORS ───────────────────────────────────────────────────
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("Default", policy =>
+    {
+        var origins = builder.Configuration
+            .GetSection("Cors:AllowedOrigins")
+            .Get<string[]>();
+
+        if (origins is { Length: > 0 })
+        {
+            policy
+                .WithOrigins(origins)
+                .AllowAnyHeader()
+                .AllowAnyMethod()
+                .AllowCredentials();
+        }
+        else
+        {
+            policy
+                .AllowAnyOrigin()
+                .AllowAnyHeader()
+                .AllowAnyMethod();
+        }
+    });
+});
+
+// ── Health Checks ──────────────────────────────────────────
 builder.Services.AddHealthChecks()
     .AddCheck("qdrant", () =>
     {
         return HealthCheckResult.Healthy("Qdrant configured");
     });
 
-builder.Services.AddCors(o => o.AddPolicy("Default", p =>
-    p.WithOrigins(builder.Configuration
-                         .GetSection("Cors:AllowedOrigins")
-                         .Get<string[]>() ?? [])
-     .AllowAnyMethod()
-     .AllowAnyHeader()
-     .AllowCredentials()));
+// ── Upload Limits ──────────────────────────────────────────
+builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(options =>
+{
+    options.MultipartBodyLengthLimit = 52_428_800; // 50 MB
+});
 
-builder.Services.AddHealthChecks();
-
-// Program.cs — before builder.Build()
+// ── Kestrel ────────────────────────────────────────────────
 builder.WebHost.ConfigureKestrel(options =>
 {
     options.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(10);
     options.Limits.RequestHeadersTimeout = TimeSpan.FromMinutes(10);
 });
 
-// Also increase the request body timeout for large uploads
-builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(options =>
-{
-    options.MultipartBodyLengthLimit = 52_428_800; // 50 MB
-});
-
 var app = builder.Build();
 
-// ── Middleware pipeline ────────────────────────────────────
+// ── Middleware Pipeline ────────────────────────────────────
 app.UseSerilogRequestLogging();
+
 app.UseMiddleware<GlobalExceptionMiddleware>();
+
 app.UseCors("Default");
 
 if (app.Environment.IsDevelopment())
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
+    app.UseSwagger(); // serves OpenAPI JSON at /swagger/v1/swagger.json
+
+    app.MapScalarApiReference(options =>
+    {
+        options
+            .WithTitle("Document Chatbot API")
+            .WithTheme(ScalarTheme.BluePlanet)
+            .WithDefaultHttpClient(ScalarTarget.CSharp, ScalarClient.HttpClient)
+            .WithOpenApiRoutePattern("/swagger/v1/swagger.json"); // point Scalar at Swashbuckle's output
+    });
 }
 
 app.UseHttpsRedirection();
-app.UseAuthorization();
-app.MapControllers();
-app.MapHealthChecks("/health");
 
+app.UseAuthorization();
+
+app.MapControllers();
+
+app.MapHealthChecks("/health");
 
 app.Run();
