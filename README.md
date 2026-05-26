@@ -787,5 +787,76 @@ Pull requests are welcome. For major changes, open an issue first to discuss wha
 5. Open a pull request
 
 ---
+## Ollama — Run AI models on your own computer
+**What it is:** Ollama is a tool that lets you download and run AI language models (like Llama, Mistral, Gemma) directly on your own computer — no cloud, no API key, no monthly bill.
+
+**Think of it like:** A Netflix app for AI models. Instead of streaming from a server, it downloads the model once and plays it locally.
+
+**Why use it?**
+- Your data never leaves your machine (great for sensitive info)
+- Works offline
+- Completely free after setup
+- One simple command: `ollama run llama3` and you're chatting
+
+**When to use it:**
+- Building a private internal chatbot for a company
+- Experimenting with models without costs
+- Running AI on edge devices or air-gapped systems
+
+![Ollama Architecture](./docs/Ollama.png)
+---
+## Qdrant — A memory bank that understands meaning
+**What it is:** Qdrant is a special kind of database that stores text as mathematical vectors (lists of numbers) and can find text that is *similar in meaning* — not just identical words.
+
+**Think of it like:** A library where books are organized by *topic and meaning*, not alphabetically. Ask "tell me about ocean creatures" and it finds the sharks chapter, the coral section, and the deep sea article — even if none of them use your exact words.
+
+**Why regular databases can't do this:**
+- A normal SQL database finds exact matches: `WHERE text = "cat"`
+- Qdrant finds *semantic matches*: "feline", "kitten", "pet" all score high
+
+**Why use it?**
+- Search your company documents by meaning
+- Find similar products, support tickets, or research papers
+- Power smart recommendations
+- It's open-source and self-hostable (pairs perfectly with Ollama)
+
+![Qdrant Architecture](./docs/Qdrant.png)
+---
+
+## RAG — Teaching AI to know your documents
+**What it is:** RAG (Retrieval-Augmented Generation) is a technique that gives an AI model access to *your specific documents* before it answers — so it stops making things up and starts citing real sources.
+
+**The core problem RAG solves:** AI models are trained once and then frozen. They don't know about your company's policies, last month's report, or your product manual. Without RAG, the AI either says "I don't know" or worse — *confidently invents a wrong answer*.
+
+**Think of it like:** Instead of asking an AI to memorize your entire handbook, you hand it the three most relevant pages right before it answers each question. It reads those pages, then responds.
+
+**The two phases:**
+
+*Phase 1 — Indexing (one-time setup):*
+- Take all your documents
+- Cut them into small chunks (paragraphs)
+- Convert each chunk to a vector using an embedding model
+- Store all vectors in Qdrant
+
+*Phase 2 — Answering (every question):*
+- User asks a question
+- Convert the question to a vector
+- Search Qdrant for the most similar chunks
+- Send those chunks + the question to the LLM
+- LLM answers using only the retrieved real content
+
+![Rag Architecture](./docs/Rag.png)
+---
+## How all three work together
+
+The real power is combining them into a **fully local, private AI assistant**:
+
+| Component | Role |
+|---|---|
+| Qdrant | Stores and searches your document knowledge |
+| Ollama | Runs the AI model locally (no cloud) |
+| RAG | The technique connecting user questions → documents → AI answers |
+
+**Example use case:** A law firm builds a private document Q&A tool. Their 10,000 legal briefs are indexed into Qdrant. A lawyer asks a question. RAG finds the 5 most relevant paragraphs. Ollama (running locally, never sending data out) reads those paragraphs and answers. No confidential data ever touches the internet.
 
 *Built with using .NET 8, Ollama, and Qdrant. Runs entirely on your machine — your documents stay private.*
